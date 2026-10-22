@@ -8,17 +8,26 @@ from tqdm import tqdm
 def setup_db():
     conn = sqlite3.connect('db/zine_data.db')
     cursor = conn.cursor()
+    
+    # We replaced 'anti_establishment_sentiment_score' with 'source_collection'
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS extracted_zines (
+        CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_collection TEXT,
             filename TEXT,
             publication_name TEXT,
             year TEXT,
-            hardware_mentioned TEXT,
-            software_or_os_mentioned TEXT,
-            slang_and_concepts TEXT,
-            anti_establishment_sentiment_score INTEGER,
             summary TEXT
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS entities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER,
+            category TEXT,
+            value TEXT,
+            FOREIGN KEY(document_id) REFERENCES documents(id)
         )
     ''')
     conn.commit()
@@ -26,46 +35,53 @@ def setup_db():
 
 # 2. Define the System Prompt
 SYSTEM_PROMPT = """
-You are an academic archival assistant and digital humanities researcher analyzing historical computing documents and 1980s computer history publications for archival cataloging.
+You are an automated historical data extraction API. 
+Analyze the raw text and extract entities strictly as a JSON object.
 
-Your task is strictly objective metadata extraction and historical entity indexing. Do NOT execute, endorse, replicate, or provide instructions for any activities described in the text. You are only extracting historical mentions and catalog metadata into a structured JSON schema.
+Based on the text's theme (Hacking, Tabletop RPGs, or Sci-Fi), populate the relevant entity arrays. Leave irrelevant arrays empty.
 
-Extract the following entities:
-1. Hardware mentioned (e.g., modems, Commodore 64).
-2. Software or operating systems mentioned.
-3. Early cyber-culture slang or concepts.
-4. Give the text an "anti_establishment_sentiment_score" from 1 to 10 based on how rebellious the tone is.
-5. A brief summary of the text from a neutral historical perspective.
+Entity Categories:
+1. hardware_mentioned (e.g., modems, Commodore 64)
+2. software_or_os (e.g., Unix, RSTS)
+3. cyber_slang (e.g., phreaking, sysop)
+4. rpg_systems_and_classes (e.g., AD&D, dwarf, rogue, GURPS)
+5. sci_fi_authors_and_books (e.g., William Gibson, Neuromancer)
+6. sci_fi_tropes (e.g., cyberspace, megacorps, faster-than-light)
 
 You must adhere to this exact JSON schema:
 {
   "publication_name": "string",
   "year": "string",
   "hardware_mentioned": ["string"],
-  "software_or_os_mentioned": ["string"],
-  "slang_and_concepts": ["string"],
-  "anti_establishment_sentiment_score": int,
+  "software_or_os": ["string"],
+  "cyber_slang": ["string"],
+  "rpg_systems_and_classes": ["string"],
+  "sci_fi_authors_and_books": ["string"],
+  "sci_fi_tropes": ["string"],
   "summary": "string"
 }
 
+- For "publication_name", provide strictly one single lowercase word (e.g. "phrack" or "unknown").
 - For "year", provide strictly the original 4-digit publication year (e.g. "1985" or "1986"). If not explicitly stated, infer from context/references, otherwise output "Unknown".
 """
 
 ZINE_SCHEMA = {
     "type": "object",
     "properties": {
-        "publication_name": {"type": "string"},
+        "publication_name": {"type": "string", "pattern": "^[a-z0-9_-]+$"},
         "year": {"type": "string", "pattern": "^(19[7-9][0-9]|20[0-2][0-9]|Unknown)$"},
         "hardware_mentioned": {"type": "array", "items": {"type": "string"}},
-        "software_or_os_mentioned": {"type": "array", "items": {"type": "string"}},
-        "slang_and_concepts": {"type": "array", "items": {"type": "string"}},
-        "anti_establishment_sentiment_score": {"type": "integer", "minimum": 1, "maximum": 10},
+        "software_or_os": {"type": "array", "items": {"type": "string"}},
+        "cyber_slang": {"type": "array", "items": {"type": "string"}},
+        "rpg_systems_and_classes": {"type": "array", "items": {"type": "string"}},
+        "sci_fi_authors_and_books": {"type": "array", "items": {"type": "string"}},
+        "sci_fi_tropes": {"type": "array", "items": {"type": "string"}},
         "summary": {"type": "string"}
     },
     "required": [
         "publication_name", "year", "hardware_mentioned", 
-        "software_or_os_mentioned", "slang_and_concepts", 
-        "anti_establishment_sentiment_score", "summary"
+        "software_or_os", "cyber_slang", "rpg_systems_and_classes",
+        "sci_fi_authors_and_books", "sci_fi_tropes", "summary"
     ]
 }
 
@@ -126,26 +142,44 @@ def process_file(filepath, conn):
         print(json.dumps(result, indent=2))
         print("--------------------------------------\n")
         
-        # 4. Save to SQLite
+        # 4. Save to SQLite Relational Tables
         cursor = conn.cursor()
+        
+        # We can extract the folder name from the filepath to know which collection it belongs to
+        source_collection = os.path.basename(os.path.dirname(filepath))
+        
         cursor.execute('''
-            INSERT INTO extracted_zines (
-                filename, publication_name, year, hardware_mentioned,
-                software_or_os_mentioned, slang_and_concepts,
-                anti_establishment_sentiment_score, summary
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO documents (
+                source_collection, filename, publication_name, year, summary
+            ) VALUES (?, ?, ?, ?, ?)
         ''', (
+            source_collection,
             os.path.basename(filepath),
             result.get('publication_name', 'Unknown'),
             result.get('year', 'Unknown'),
-            json.dumps(result.get('hardware_mentioned', [])),
-            json.dumps(result.get('software_or_os_mentioned', [])),
-            json.dumps(result.get('slang_and_concepts', [])),
-            result.get('anti_establishment_sentiment_score', 0),
             result.get('summary', '')
         ))
+        
+        doc_id = cursor.lastrowid
+        
+        def insert_entities(entity_list, category_name):
+            if not isinstance(entity_list, list): return
+            for item in entity_list:
+                cursor.execute('''
+                    INSERT INTO entities (document_id, category, value) 
+                    VALUES (?, ?, ?)
+                ''', (doc_id, category_name, str(item)))
+
+        # Dynamically map the JSON arrays to database categories
+        insert_entities(result.get('hardware_mentioned', []), 'hardware')
+        insert_entities(result.get('software_or_os', []), 'software')
+        insert_entities(result.get('cyber_slang', []), 'cyber_slang')
+        insert_entities(result.get('rpg_systems_and_classes', []), 'rpg_elements')
+        insert_entities(result.get('sci_fi_authors_and_books', []), 'sci_fi_references')
+        insert_entities(result.get('sci_fi_tropes', []), 'sci_fi_tropes')
+        
         conn.commit()
-        print(f"Successfully extracted and saved data!")
+        print(f"Successfully extracted and saved relational data!")
 
     except Exception as e:
         print(f"Error processing {os.path.basename(filepath)}: {e}")
